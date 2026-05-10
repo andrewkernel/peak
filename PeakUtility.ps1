@@ -10,6 +10,8 @@ $script:Version = "0.2.0"
 $script:AppName = "Peak Utility"
 $script:DefaultRoot = "C:\Users\Andrew\Downloads\Insstincts Optimizations-main-20260411T030202Z-3-001\Insstincts Optimizations-main"
 $script:LogFile = Join-Path $PSScriptRoot "PeakUtility.log"
+$script:AuthFile = Join-Path $PSScriptRoot "PeakUtility.auth.json"
+$script:AuthIterations = 120000
 $script:Categories = @(
     @{ Key = "1"; Folder = "1 Check"; Title = "Check / Diagnostics" }
     @{ Key = "2"; Folder = "2 Refresh"; Title = "Refresh" }
@@ -30,6 +32,170 @@ function Show-Help {
     Write-Host "  PeakUtility.ps1 -SelfTest"
     Write-Host ""
     Write-Host "Double-click PeakUtility.bat for the easiest launch."
+}
+
+function ConvertFrom-SecurePassword {
+    param([Parameter(Mandatory)][Security.SecureString]$SecurePassword)
+
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePassword)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    }
+    finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+}
+
+function New-RandomSalt {
+    $salt = New-Object byte[] 16
+    $rng = [Security.Cryptography.RNGCryptoServiceProvider]::Create()
+    try {
+        $rng.GetBytes($salt)
+    }
+    finally {
+        $rng.Dispose()
+    }
+
+    return $salt
+}
+
+function Get-PasswordHash {
+    param(
+        [Parameter(Mandatory)][string]$Password,
+        [Parameter(Mandatory)][byte[]]$Salt,
+        [Parameter(Mandatory)][int]$Iterations
+    )
+
+    $derive = New-Object Security.Cryptography.Rfc2898DeriveBytes -ArgumentList $Password, $Salt, $Iterations
+    try {
+        return [Convert]::ToBase64String($derive.GetBytes(32))
+    }
+    finally {
+        $derive.Dispose()
+    }
+}
+
+function Test-HashMatch {
+    param(
+        [Parameter(Mandatory)][string]$ExpectedHash,
+        [Parameter(Mandatory)][string]$ActualHash
+    )
+
+    $expectedBytes = [Convert]::FromBase64String($ExpectedHash)
+    $actualBytes = [Convert]::FromBase64String($ActualHash)
+
+    if ($expectedBytes.Length -ne $actualBytes.Length) {
+        return $false
+    }
+
+    $diff = 0
+    for ($index = 0; $index -lt $expectedBytes.Length; $index++) {
+        $diff = $diff -bor ($expectedBytes[$index] -bxor $actualBytes[$index])
+    }
+
+    return $diff -eq 0
+}
+
+function Read-AuthConfig {
+    if (-not (Test-Path -LiteralPath $script:AuthFile -PathType Leaf)) {
+        return $null
+    }
+
+    try {
+        return Get-Content -LiteralPath $script:AuthFile -Raw | ConvertFrom-Json
+    }
+    catch {
+        return $null
+    }
+}
+
+function New-AuthConfig {
+    while ($true) {
+        Show-Header
+        Write-Host "Create Peak Utility sign-in"
+        Write-Host ""
+
+        $username = (Read-Host "Username").Trim()
+        if ([string]::IsNullOrWhiteSpace($username)) {
+            Write-Host ""
+            Write-Host "Username cannot be blank."
+            Start-Sleep -Seconds 1
+            continue
+        }
+
+        $password = ConvertFrom-SecurePassword (Read-Host "Password" -AsSecureString)
+        $confirmPassword = ConvertFrom-SecurePassword (Read-Host "Confirm password" -AsSecureString)
+
+        if ([string]::IsNullOrEmpty($password)) {
+            Write-Host ""
+            Write-Host "Password cannot be blank."
+            Start-Sleep -Seconds 1
+            continue
+        }
+
+        if ($password -cne $confirmPassword) {
+            Write-Host ""
+            Write-Host "Passwords did not match."
+            Start-Sleep -Seconds 1
+            continue
+        }
+
+        $salt = New-RandomSalt
+        $config = [pscustomobject]@{
+            username = $username
+            salt = [Convert]::ToBase64String($salt)
+            hash = Get-PasswordHash -Password $password -Salt $salt -Iterations $script:AuthIterations
+            iterations = $script:AuthIterations
+            createdUtc = (Get-Date).ToUniversalTime().ToString("o")
+        }
+
+        $config | ConvertTo-Json | Set-Content -LiteralPath $script:AuthFile -Encoding UTF8
+        Write-Host ""
+        Write-Host "Sign-in created."
+        Start-Sleep -Seconds 1
+        return $config
+    }
+}
+
+function Invoke-UserAuth {
+    $auth = Read-AuthConfig
+    if ($null -eq $auth) {
+        $auth = New-AuthConfig
+    }
+
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        Show-Header
+        Write-Host "Sign in"
+        Write-Host ""
+
+        $username = (Read-Host "Username").Trim()
+        $password = ConvertFrom-SecurePassword (Read-Host "Password" -AsSecureString)
+
+        try {
+            $salt = [Convert]::FromBase64String($auth.salt)
+            $actualHash = Get-PasswordHash -Password $password -Salt $salt -Iterations ([int]$auth.iterations)
+            $userMatches = [string]::Equals($username, [string]$auth.username, [StringComparison]::OrdinalIgnoreCase)
+
+            if ($userMatches -and (Test-HashMatch -ExpectedHash ([string]$auth.hash) -ActualHash $actualHash)) {
+                return
+            }
+        }
+        catch {
+            Write-Host ""
+            Write-Host "The auth file is invalid. Creating a fresh sign-in."
+            Start-Sleep -Seconds 1
+            New-AuthConfig | Out-Null
+            return
+        }
+
+        Write-Host ""
+        Write-Host "Invalid username or password."
+        Start-Sleep -Seconds 1
+    }
+
+    Write-Host ""
+    Write-Host "Too many failed sign-in attempts."
+    exit 1
 }
 
 function Test-IsAdmin {
@@ -383,6 +549,7 @@ if (-not (Test-IsAdmin)) {
 }
 
 $Host.UI.RawUI.WindowTitle = "$script:AppName $script:Version"
+Invoke-UserAuth
 $script:OptRoot = Resolve-OptimizationRoot
 Initialize-Log
 Ask-RestorePoint
